@@ -4,7 +4,7 @@
     Build and flash firmware to STM32H723 via OpenOCD + ST-Link
 .DESCRIPTION
     Windows equivalent of the original flash_openocd.sh.
-    Auto-detects cmake / OpenOCD toolchain, builds (optional), then flashes .elf.
+    Uses cmake-build-debug, auto-detects CMake / OpenOCD, builds (optional), then flashes .elf.
 .PARAMETER ElfPath
     Path to .elf file. Omit to auto-find in common build directories.
 .PARAMETER NoBuild
@@ -12,7 +12,7 @@
 .EXAMPLE
     .\flash_openocd.ps1
 .EXAMPLE
-    .\flash_openocd.ps1 -ElfPath .\build\Debug\Engineer_2026_H7_Template_new.elf -NoBuild
+    .\flash_openocd.ps1 -ElfPath .\cmake-build-debug\Engineer_2026_H7_Template_new.elf -NoBuild
 #>
 param(
     [string]$ElfPath,
@@ -23,10 +23,20 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CfgPath = Join-Path $ProjectRoot "stm32h723.cfg"
 $ElfName = "Engineer_2026_H7_Template_new.elf"
+$BuildDir = Join-Path $ProjectRoot "cmake-build-debug"
 
 # --------------- Tool detection ---------------
 
 function Find-Cmake {
+    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
+    if (Test-Path $cachePath -PathType Leaf) {
+        $cacheEntry = Get-Content $cachePath | Where-Object { $_ -like "CMAKE_COMMAND:INTERNAL=*" } | Select-Object -First 1
+        if ($cacheEntry) {
+            $cachedCmake = ($cacheEntry -split "=", 2)[1]
+            if (Test-Path $cachedCmake -PathType Leaf) { return $cachedCmake }
+        }
+    }
+
     $cmake = Get-Command "cmake.exe" -ErrorAction SilentlyContinue
     if ($cmake) { return $cmake.Source }
 
@@ -118,24 +128,6 @@ function Find-OpenOcd {
     return $null
 }
 
-# --------------- ELF search ---------------
-
-function Find-Elf {
-    param([string]$Name)
-    $searchDirs = @(
-        (Join-Path $ProjectRoot "build"),
-        (Join-Path $ProjectRoot "build\Debug"),
-        (Join-Path $ProjectRoot "build\Release"),
-        (Join-Path $ProjectRoot "cmake-build-debug"),
-        (Join-Path $ProjectRoot "cmake-build-release")
-    )
-    foreach ($d in $searchDirs) {
-        $f = Join-Path $d $Name
-        if (Test-Path $f -PathType Leaf) { return $f }
-    }
-    return $null
-}
-
 # --------------- Main ---------------
 
 Write-Host "========================================" -ForegroundColor Cyan
@@ -158,27 +150,25 @@ if ($ElfPath) {
     if (-not $NoBuild) {
         $cmake = Find-Cmake
         if (-not $cmake) {
-            Write-Host "[WARN] cmake.exe not found, skipping build." -ForegroundColor Yellow
-        } else {
-            $buildDir = Join-Path $ProjectRoot "build"
-            if (Test-Path $buildDir -PathType Container) {
-                Write-Host "Building..." -ForegroundColor Green
-                & $cmake --build $buildDir
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Host "[ERROR] Build failed" -ForegroundColor Red
-                    exit 1
-                }
-            } else {
-                Write-Host "[WARN] Build dir not found: $buildDir" -ForegroundColor Yellow
-                Write-Host "  You may need to run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug" -ForegroundColor Yellow
-            }
+            Write-Host "[ERROR] cmake.exe not found; refusing to flash an existing ELF." -ForegroundColor Red
+            exit 1
+        }
+        if (-not (Test-Path (Join-Path $BuildDir "CMakeCache.txt") -PathType Leaf)) {
+            Write-Host "[ERROR] Configured build directory not found: $BuildDir" -ForegroundColor Red
+            exit 1
+        }
+
+        Write-Host "Building: $BuildDir" -ForegroundColor Green
+        & $cmake --build $BuildDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] Build failed" -ForegroundColor Red
+            exit 1
         }
     }
 
-    $ElfPath = Find-Elf $ElfName
-    if (-not $ElfPath) {
-        Write-Host "[ERROR] $ElfName not found." -ForegroundColor Red
-        Write-Host "  Make sure you have built the project first." -ForegroundColor Yellow
+    $ElfPath = Join-Path $BuildDir $ElfName
+    if (-not (Test-Path $ElfPath -PathType Leaf)) {
+        Write-Host "[ERROR] ELF not found in configured build directory: $ElfPath" -ForegroundColor Red
         exit 1
     }
 }
@@ -218,9 +208,7 @@ if ($scriptsDir) {
 $ocdArgs += "-f"; $ocdArgs += $CfgPath
 $ocdArgs += "-c"; $ocdArgs += "tcl_port disabled"
 $ocdArgs += "-c"; $ocdArgs += "gdb_port disabled"
-$ocdArgs += "-c"; $ocdArgs += "program $ElfPath"
-$ocdArgs += "-c"; $ocdArgs += "reset"
-$ocdArgs += "-c"; $ocdArgs += "shutdown"
+$ocdArgs += "-c"; $ocdArgs += "program {$ElfPath} verify reset exit"
 
 & $openocdExe $ocdArgs
 $exit = $LASTEXITCODE

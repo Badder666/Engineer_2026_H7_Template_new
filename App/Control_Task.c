@@ -44,7 +44,7 @@ static void Robotic_Arm_Motor_cal(void);
 static bool lifting_mode_changed(void);
 static void Elevator_set_feedforward_and_pos(void);
 static void Elevator_set_start_error_pos(void);
-static void Robotic_Arm_set_start_error_pos(void);
+static void Robotic_Arm_reset_ramped_target(void);
 static void Robotic_Arm_set_feedfoward(void);
 static void chassis_set_leds(GPIO_PinState state);
 
@@ -91,7 +91,6 @@ PID_Info_TypeDef Robotic_Arm_FF_PID[ROBOTIC_ARM_DOF];
 
 TickType_t Control_Task_SysTick = 0;
 TickType_t Timer_When_Lift_Stage_Changed = 0;
-TickType_t Timer_When_Mode_Changed = 0;
 void Control_Task(void const * argument)
 {
     /* USER CODE BEGIN Control_Task */
@@ -119,7 +118,6 @@ void Control_Task(void const * argument)
         }
 
 	    Timer_When_Lift_Stage_Changed++;
-        Timer_When_Mode_Changed++;
 
         float power_data[9] = {
             //Chassis_Motor[LF].Data.Current, Chassis_Motor[LB].Data.Current,
@@ -210,16 +208,16 @@ static void chassis_lifting_handler(void)
         HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_13);
         HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_14);
     }
-    chassis_info.activated_flag = true;
     if (lifting_mode_changed()) {
         Timer_When_Lift_Stage_Changed = 0;
         Elevator_set_feedforward_and_pos();
         Elevator_set_start_error_pos();
     }
-    if (mode_changed_to_normal()){
-        Timer_When_Mode_Changed = 0;
-        Robotic_Arm_set_start_error_pos();
+    /* 必须先初始化斜坡起点再发布使能标志，避免 CAN 任务发送默认的零位目标。 */
+    if (!chassis_info.activated_flag) {
+        Robotic_Arm_reset_ramped_target();
     }
+    chassis_info.activated_flag = true;
     Chassis_Motor_cal(chassis_info.activated_flag);
     Elevator_Motor_cal();
     Robotic_Arm_Motor_cal();
@@ -242,6 +240,9 @@ static void chassis_disabled_handler(void)
     Chassis_Motor[LB].Data.Ramped_Target_Velocity = 0.0f;
     Chassis_Motor[RB].Data.Ramped_Target_Velocity = 0.0f;
     Chassis_Motor[RF].Data.Ramped_Target_Velocity = 0.0f;
+
+    /* 失能期间持续跟随实测位置，保证下次使能从机械臂当前位置开始斜坡。 */
+    Robotic_Arm_reset_ramped_target();
 
     /* 关节失能时清空前馈 PID, 防止积分饱和与残留前馈输出 */
     for (uint8_t i = 0; i < ROBOTIC_ARM_DOF; i++) {
@@ -416,27 +417,11 @@ static void Elevator_Motor_cal(void)
 
 static void Robotic_Arm_Motor_cal(void)
 {
-    if (Timer_When_Mode_Changed > ROBOTIC_ARM_MOVING_TIME) {
-        Robotic_Arm_Motor[J1].Data.Temp_Target_Position = Robotic_Arm_Motor[J1].Data.Target_Position;
-        Robotic_Arm_Motor[J2].Data.Temp_Target_Position = Robotic_Arm_Motor[J2].Data.Target_Position;
-        Robotic_Arm_Motor[J3].Data.Temp_Target_Position = Robotic_Arm_Motor[J3].Data.Target_Position;
-        Robotic_Arm_Motor[J4].Data.Temp_Target_Position = Robotic_Arm_Motor[J4].Data.Target_Position;
-        Robotic_Arm_Motor[J5].Data.Temp_Target_Position = Robotic_Arm_Motor[J5].Data.Target_Position;
-        Robotic_Arm_Motor[J6].Data.Temp_Target_Position = Robotic_Arm_Motor[J6].Data.Target_Position;
-    }
-    else{
-        Robotic_Arm_Motor[J1].Data.Temp_Target_Position = Robotic_Arm_Motor[J1].Data.Start_Position + Robotic_Arm_Motor[J1].Data.Error_Position *
-        SmootherStep(Timer_When_Lift_Stage_Changed, ROBOTIC_ARM_MOVING_TIME);
-        Robotic_Arm_Motor[J2].Data.Temp_Target_Position = Robotic_Arm_Motor[J2].Data.Start_Position + Robotic_Arm_Motor[J2].Data.Error_Position *
-        SmootherStep(Timer_When_Lift_Stage_Changed, ROBOTIC_ARM_MOVING_TIME);
-        Robotic_Arm_Motor[J3].Data.Temp_Target_Position = Robotic_Arm_Motor[J3].Data.Start_Position + Robotic_Arm_Motor[J3].Data.Error_Position *
-        SmootherStep(Timer_When_Lift_Stage_Changed, ROBOTIC_ARM_MOVING_TIME);
-        Robotic_Arm_Motor[J4].Data.Temp_Target_Position = Robotic_Arm_Motor[J4].Data.Start_Position + Robotic_Arm_Motor[J4].Data.Error_Position *
-        SmootherStep(Timer_When_Lift_Stage_Changed, ROBOTIC_ARM_MOVING_TIME);
-        Robotic_Arm_Motor[J5].Data.Temp_Target_Position = Robotic_Arm_Motor[J5].Data.Start_Position + Robotic_Arm_Motor[J5].Data.Error_Position *
-        SmootherStep(Timer_When_Lift_Stage_Changed, ROBOTIC_ARM_MOVING_TIME);
-        Robotic_Arm_Motor[J6].Data.Temp_Target_Position = Robotic_Arm_Motor[J6].Data.Start_Position + Robotic_Arm_Motor[J6].Data.Error_Position *
-        SmootherStep(Timer_When_Lift_Stage_Changed, ROBOTIC_ARM_MOVING_TIME);
+    for (uint8_t i = 0; i < ROBOTIC_ARM_DOF; i++) {
+        Robotic_Arm_Motor[i].Data.Temp_Target_Position = f_Ramp_Calc(
+            Robotic_Arm_Motor[i].Data.Temp_Target_Position,
+            Robotic_Arm_Motor[i].Data.Target_Position,
+            ROBOTIC_ARM_TARGET_POSITION_RAMP);
     }
 }
 
@@ -555,21 +540,11 @@ static void Elevator_set_start_error_pos(void)
     Elevator_Motor[RB].Data.Error_Position = Elevator_Motor[RB].Data.Target_Position - Elevator_Motor[RB].Data.Start_Position;
     Elevator_Motor[RF].Data.Error_Position = Elevator_Motor[RF].Data.Target_Position - Elevator_Motor[RF].Data.Start_Position;
 }
-static void Robotic_Arm_set_start_error_pos(void)
+static void Robotic_Arm_reset_ramped_target(void)
 {
-    Robotic_Arm_Motor[J1].Data.Start_Position = Robotic_Arm_Motor[J1].Data.Position;
-    Robotic_Arm_Motor[J2].Data.Start_Position = Robotic_Arm_Motor[J2].Data.Position;
-    Robotic_Arm_Motor[J3].Data.Start_Position = Robotic_Arm_Motor[J3].Data.Position;
-    Robotic_Arm_Motor[J4].Data.Start_Position = Robotic_Arm_Motor[J4].Data.Position;
-    Robotic_Arm_Motor[J5].Data.Start_Position = Robotic_Arm_Motor[J5].Data.Position;
-    Robotic_Arm_Motor[J6].Data.Start_Position = Robotic_Arm_Motor[J6].Data.Position;
-
-    Robotic_Arm_Motor[J1].Data.Error_Position = Robotic_Arm_Motor[J1].Data.Target_Position - Robotic_Arm_Motor[J1].Data.Start_Position;
-    Robotic_Arm_Motor[J2].Data.Error_Position = Robotic_Arm_Motor[J2].Data.Target_Position - Robotic_Arm_Motor[J2].Data.Start_Position;
-    Robotic_Arm_Motor[J3].Data.Error_Position = Robotic_Arm_Motor[J3].Data.Target_Position - Robotic_Arm_Motor[J3].Data.Start_Position;
-    Robotic_Arm_Motor[J4].Data.Error_Position = Robotic_Arm_Motor[J4].Data.Target_Position - Robotic_Arm_Motor[J4].Data.Start_Position;
-    Robotic_Arm_Motor[J5].Data.Error_Position = Robotic_Arm_Motor[J5].Data.Target_Position - Robotic_Arm_Motor[J5].Data.Start_Position;
-    Robotic_Arm_Motor[J6].Data.Error_Position = Robotic_Arm_Motor[J6].Data.Target_Position - Robotic_Arm_Motor[J6].Data.Start_Position;
+    for (uint8_t i = 0; i < ROBOTIC_ARM_DOF; i++) {
+        Robotic_Arm_Motor[i].Data.Temp_Target_Position = Robotic_Arm_Motor[i].Data.Position;
+    }
 }
 
 #define GravityCompensation 1

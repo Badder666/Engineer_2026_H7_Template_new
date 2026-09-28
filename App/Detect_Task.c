@@ -61,6 +61,176 @@ extern Referee_System_Info_TypeDef Referee_System_Info;
 
 Hand_State_e hand_state = HAND_CLOSE;
 TickType_t Detect_Task_SysTick = 0;
+
+/*
+ * Chassis mode control is represented as static transition tables.  Input
+ * decoding stays in chassis_set_mode(), while these actions only update the
+ * state model consumed by Control_Task.
+ */
+typedef enum
+{
+    CHASSIS_FSM_EVENT_NONE = 0,
+    CHASSIS_FSM_EVENT_KEY_F,
+    CHASSIS_FSM_EVENT_KEY_Q,
+    CHASSIS_FSM_EVENT_KEY_Z,
+    CHASSIS_FSM_EVENT_KEY_X,
+    CHASSIS_FSM_EVENT_KEY_E,
+    CHASSIS_FSM_EVENT_RC_DISABLE,
+    CHASSIS_FSM_EVENT_RC_MANUAL_STAGE,
+    CHASSIS_FSM_EVENT_RC_AUTO_1,
+    CHASSIS_FSM_EVENT_RC_AUTO_2,
+    CHASSIS_FSM_EVENT_HAND_TOGGLE
+} Chassis_Fsm_Event_e;
+
+typedef struct
+{
+    Chassis_Info_Typedef *chassis;
+    Chassis_LIFT_Mode_e requested_lift_mode;
+} Chassis_Fsm_Context_Typedef;
+
+typedef void (*Chassis_Fsm_Action)(Chassis_Fsm_Context_Typedef *ctx);
+
+typedef struct
+{
+    int16_t current_state;
+    Chassis_Fsm_Event_e event;
+    Chassis_Fsm_Action action;
+    int16_t next_state;
+} Chassis_Fsm_Transition_Typedef;
+
+#define CHASSIS_FSM_STATE_ANY ((int16_t)-1)
+
+static void chassis_fsm_action_none(Chassis_Fsm_Context_Typedef *ctx)
+{
+    (void)ctx;
+}
+
+static void chassis_fsm_action_auto_lift_1(Chassis_Fsm_Context_Typedef *ctx)
+{
+    if (ctx->chassis->last_mode == CHASSIS_LIFT)
+        ctx->chassis->lift_mode = LIFT_STAGE_1;
+}
+
+static void chassis_fsm_action_auto_lift_2(Chassis_Fsm_Context_Typedef *ctx)
+{
+    if (ctx->chassis->last_mode == CHASSIS_LIFT)
+        ctx->chassis->lift_mode = LIFT_STAGE_1;
+}
+
+static void chassis_fsm_action_lift_stage_3(Chassis_Fsm_Context_Typedef *ctx)
+{
+    ctx->chassis->lift_mode = LIFT_STAGE_3;
+}
+
+static void chassis_fsm_action_manual_stage(Chassis_Fsm_Context_Typedef *ctx)
+{
+    ctx->chassis->lift_mode = ctx->requested_lift_mode;
+}
+
+static void chassis_fsm_action_stage_5(Chassis_Fsm_Context_Typedef *ctx)
+{
+    ctx->chassis->lift_mode = LIFT_STAGE_5;
+}
+
+static void chassis_fsm_action_stage_1(Chassis_Fsm_Context_Typedef *ctx)
+{
+    ctx->chassis->lift_mode = LIFT_STAGE_1;
+}
+
+static void chassis_fsm_action_stage_4(Chassis_Fsm_Context_Typedef *ctx)
+{
+    ctx->chassis->lift_mode = LIFT_STAGE_4;
+}
+
+static void chassis_fsm_action_toggle_gear(Chassis_Fsm_Context_Typedef *ctx)
+{
+    ctx->chassis->gear = (ctx->chassis->gear == 0U) ? 1U : 0U;
+}
+
+static void chassis_fsm_action_toggle_hand(Chassis_Fsm_Context_Typedef *ctx)
+{
+    (void)ctx;
+    hand_state = (hand_state == HAND_OPEN) ? HAND_CLOSE : HAND_OPEN;
+}
+
+static const Chassis_Fsm_Transition_Typedef chassis_mode_fsm_table[] =
+{
+    {(int16_t)CHASSIS_LIFT,          CHASSIS_FSM_EVENT_KEY_F,          chassis_fsm_action_auto_lift_1, CHASSIS_AUTO_LIFT_1},
+    {(int16_t)CHASSIS_AUTO_LIFT_1,   CHASSIS_FSM_EVENT_KEY_F,          chassis_fsm_action_auto_lift_2, CHASSIS_AUTO_LIFT_2},
+    {(int16_t)CHASSIS_AUTO_LIFT_2,   CHASSIS_FSM_EVENT_KEY_F,          chassis_fsm_action_lift_stage_3, CHASSIS_LIFT},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_KEY_F,          chassis_fsm_action_none,         CHASSIS_DISABLE},
+    {(int16_t)CHASSIS_LIFT,          CHASSIS_FSM_EVENT_KEY_Q,          chassis_fsm_action_none,         CHASSIS_DISABLE},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_KEY_Q,          chassis_fsm_action_none,         CHASSIS_LIFT},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_RC_DISABLE,     chassis_fsm_action_none,         CHASSIS_DISABLE},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_RC_MANUAL_STAGE,chassis_fsm_action_manual_stage, CHASSIS_LIFT},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_RC_AUTO_1,      chassis_fsm_action_auto_lift_1, CHASSIS_AUTO_LIFT_1},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_RC_AUTO_2,      chassis_fsm_action_auto_lift_2, CHASSIS_AUTO_LIFT_2}
+};
+
+static const Chassis_Fsm_Transition_Typedef chassis_lift_stage_fsm_table[] =
+{
+    {(int16_t)LIFT_STAGE_3,          CHASSIS_FSM_EVENT_KEY_Z,          chassis_fsm_action_stage_5,     LIFT_STAGE_5},
+    {(int16_t)LIFT_STAGE_5,          CHASSIS_FSM_EVENT_KEY_Z,          chassis_fsm_action_stage_1,     LIFT_STAGE_1},
+    {(int16_t)LIFT_STAGE_1,          CHASSIS_FSM_EVENT_KEY_Z,          chassis_fsm_action_lift_stage_3, LIFT_STAGE_3},
+    {(int16_t)LIFT_STAGE_6,          CHASSIS_FSM_EVENT_KEY_Z,          chassis_fsm_action_lift_stage_3, LIFT_STAGE_3},
+    {(int16_t)LIFT_STAGE_4,          CHASSIS_FSM_EVENT_KEY_X,          chassis_fsm_action_lift_stage_3, LIFT_STAGE_3},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_KEY_X,          chassis_fsm_action_stage_4,     LIFT_STAGE_4}
+};
+
+static const Chassis_Fsm_Transition_Typedef chassis_action_fsm_table[] =
+{
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_KEY_E,          chassis_fsm_action_toggle_gear,  CHASSIS_FSM_STATE_ANY},
+    {CHASSIS_FSM_STATE_ANY,          CHASSIS_FSM_EVENT_HAND_TOGGLE,     chassis_fsm_action_toggle_hand,  CHASSIS_FSM_STATE_ANY}
+};
+
+static void chassis_fsm_dispatch_mode(Chassis_Fsm_Context_Typedef *ctx,
+                                       Chassis_Fsm_Event_e event)
+{
+    for (uint32_t i = 0U; i < (sizeof(chassis_mode_fsm_table) / sizeof(chassis_mode_fsm_table[0])); i++)
+    {
+        const Chassis_Fsm_Transition_Typedef *transition = &chassis_mode_fsm_table[i];
+        if (transition->event != event)
+            continue;
+        if (transition->current_state != CHASSIS_FSM_STATE_ANY &&
+            transition->current_state != (int16_t)ctx->chassis->mode)
+            continue;
+
+        transition->action(ctx);
+        ctx->chassis->mode = (Chassis_Mode_e)transition->next_state;
+        return;
+    }
+}
+
+static void chassis_fsm_dispatch_lift_stage(Chassis_Fsm_Context_Typedef *ctx,
+                                             Chassis_Fsm_Event_e event)
+{
+    for (uint32_t i = 0U; i < (sizeof(chassis_lift_stage_fsm_table) / sizeof(chassis_lift_stage_fsm_table[0])); i++)
+    {
+        const Chassis_Fsm_Transition_Typedef *transition = &chassis_lift_stage_fsm_table[i];
+        if (transition->event != event)
+            continue;
+        if (transition->current_state != CHASSIS_FSM_STATE_ANY &&
+            transition->current_state != (int16_t)ctx->chassis->lift_mode)
+            continue;
+
+        transition->action(ctx);
+        return;
+    }
+}
+
+static void chassis_fsm_dispatch_action(Chassis_Fsm_Context_Typedef *ctx,
+                                         Chassis_Fsm_Event_e event)
+{
+    for (uint32_t i = 0U; i < (sizeof(chassis_action_fsm_table) / sizeof(chassis_action_fsm_table[0])); i++)
+    {
+        const Chassis_Fsm_Transition_Typedef *transition = &chassis_action_fsm_table[i];
+        if (transition->event != event)
+            continue;
+
+        transition->action(ctx);
+        return;
+    }
+}
 /**
 * @brief Function implementing the StartDetectTask thread.
 * @param argument: Not used
@@ -123,58 +293,34 @@ static void chassis_set_mode(Chassis_Info_Typedef* chassis)
     if(chassis == NULL)
         return;
 
+    Chassis_Fsm_Context_Typedef fsm_context = {
+        .chassis = chassis,
+        .requested_lift_mode = chassis->lift_mode
+    };
+    const Chassis_Mode_e previous_mode = chassis->mode;
+    const Chassis_LIFT_Mode_e previous_lift_mode = chassis->lift_mode;
+
+    /* Keep the compatibility fields as a one-cycle snapshot for Control_Task. */
+    chassis->last_mode = previous_mode;
+    chassis->last_lift_mode = previous_lift_mode;
+
     if (remote_ctrl.rc_lost) {
         if(MiniPC_Data.key_r) HAL_NVIC_SystemReset();
-        chassis->last_mode = chassis->mode;
-        chassis->last_lift_mode = chassis->lift_mode;
+
         if(MINIPC_KEY_RISING_EDGE(key_f)) {
-            if (chassis->last_mode == CHASSIS_LIFT) {
-                chassis->lift_mode = LIFT_STAGE_1;
-                chassis->mode = CHASSIS_AUTO_LIFT_1;
-            } else if(chassis->last_mode == CHASSIS_AUTO_LIFT_1) {
-                chassis->lift_mode = LIFT_STAGE_1;
-                chassis->mode = CHASSIS_AUTO_LIFT_2;
-            } else if(chassis->last_mode == CHASSIS_AUTO_LIFT_2) {
-                chassis->lift_mode = LIFT_STAGE_3;
-                chassis->mode = CHASSIS_LIFT;
-            } else {
-                chassis->mode = CHASSIS_DISABLE;
-            }
-        }else if(MINIPC_KEY_RISING_EDGE(key_q)) {
-            if (chassis->mode == CHASSIS_LIFT) {
-                chassis->mode = CHASSIS_DISABLE;
-            } else {
-                chassis->mode = CHASSIS_LIFT;
-            }
+            chassis_fsm_dispatch_mode(&fsm_context, CHASSIS_FSM_EVENT_KEY_F);
+        } else if(MINIPC_KEY_RISING_EDGE(key_q)) {
+            chassis_fsm_dispatch_mode(&fsm_context, CHASSIS_FSM_EVENT_KEY_Q);
         }
+
         if(MINIPC_KEY_RISING_EDGE(key_z)) {
-            if (chassis->lift_mode == LIFT_STAGE_3) {
-                chassis->lift_mode = LIFT_STAGE_5;
-            } else if (chassis->lift_mode == LIFT_STAGE_5) {
-                chassis->lift_mode = LIFT_STAGE_1;
-            } else if (chassis->lift_mode == LIFT_STAGE_1 || chassis->lift_mode == LIFT_STAGE_6) {
-                chassis->lift_mode = LIFT_STAGE_3;
-            }
+            chassis_fsm_dispatch_lift_stage(&fsm_context, CHASSIS_FSM_EVENT_KEY_Z);
         }else if(MINIPC_KEY_RISING_EDGE(key_x)) {
-            if(chassis->lift_mode == LIFT_STAGE_4) {
-                chassis->lift_mode = LIFT_STAGE_3;
-            } else {
-                chassis->lift_mode = LIFT_STAGE_4;
-            }
+            chassis_fsm_dispatch_lift_stage(&fsm_context, CHASSIS_FSM_EVENT_KEY_X);
         }
+
         if(MINIPC_KEY_RISING_EDGE(key_e)) {
-            if (chassis->gear == 0) {
-                chassis->gear = 1;
-            } else {
-                chassis->gear = 0;
-            }
-        }
-        if(MINIPC_KEY_RISING_EDGE(btn1)) {
-            if (hand_state == HAND_OPEN) {
-                hand_state = HAND_CLOSE;
-            } else {
-                hand_state = HAND_OPEN;
-            }
+            chassis_fsm_dispatch_action(&fsm_context, CHASSIS_FSM_EVENT_KEY_E);
         }
     } else {
         if(remote_ctrl.rc.ch[5] <= -630) HAL_NVIC_SystemReset();
@@ -192,54 +338,37 @@ static void chassis_set_mode(Chassis_Info_Typedef* chassis)
             //M2006_Gripper_Motor.Data.Target_Angle = GRIPPER_CLOSE_POS;
         //}
 
+        Chassis_Fsm_Event_e mode_event = CHASSIS_FSM_EVENT_NONE;
         if (switch_is_up(sw0)) {
-            chassis->last_mode = chassis->mode;
-            chassis->mode = CHASSIS_DISABLE;
+            mode_event = CHASSIS_FSM_EVENT_RC_DISABLE;
         } else if (remote_ctrl.rc.ch[4] >= 630) {
-            chassis->last_mode = chassis->mode;
-            chassis->last_lift_mode = chassis->lift_mode;
-            chassis->mode = CHASSIS_LIFT;
-            chassis->lift_mode = LIFT_STAGE_4;
+            fsm_context.requested_lift_mode = LIFT_STAGE_4;
+            mode_event = CHASSIS_FSM_EVENT_RC_MANUAL_STAGE;
         } else if (switch_is_up(s1) && switch_is_up(sw1)) {
-            chassis->last_mode = chassis->mode;
-            chassis->last_lift_mode = chassis->lift_mode;
-            chassis->mode = CHASSIS_LIFT;
+            mode_event = CHASSIS_FSM_EVENT_RC_MANUAL_STAGE;
             switch (s0) {
-                case RC_SW_DOWN: chassis->lift_mode = LIFT_STAGE_1; break;
-                case RC_SW_MID:  chassis->lift_mode = LIFT_STAGE_5; break;
-                case RC_SW_UP:   chassis->lift_mode = LIFT_STAGE_3; break;
+                case RC_SW_DOWN: fsm_context.requested_lift_mode = LIFT_STAGE_1; break;
+                case RC_SW_MID:  fsm_context.requested_lift_mode = LIFT_STAGE_5; break;
+                case RC_SW_UP:   fsm_context.requested_lift_mode = LIFT_STAGE_3; break;
                 default: break;
             }
-        } else if (switch_is_down(s1)) {
-            chassis->last_mode = chassis->mode;
-            chassis->last_lift_mode = chassis->lift_mode;
-            chassis->mode = CHASSIS_AUTO_LIFT_1;
-            if(chassis->last_mode == CHASSIS_LIFT) {
-                chassis->lift_mode = LIFT_STAGE_1;
-            }
-        } else if (switch_is_down(sw1)) {
-            chassis->last_mode = chassis->mode;
-            chassis->last_lift_mode = chassis->lift_mode;
-            chassis->mode = CHASSIS_AUTO_LIFT_2;
-            if(chassis->last_mode == CHASSIS_LIFT) {
-                chassis->lift_mode = LIFT_STAGE_1;
-            }
         }
 
-        if(MINIPC_KEY_RISING_EDGE(btn1)) {
-            if (hand_state == HAND_OPEN) {
-                hand_state = HAND_CLOSE;
-            } else {
-                hand_state = HAND_OPEN;
-            }
+        /* Match the old project: automatic lift selection follows manual modes. */
+        if (mode_event == CHASSIS_FSM_EVENT_NONE && switch_is_down(s1)) {
+            mode_event = CHASSIS_FSM_EVENT_RC_AUTO_1;
+        } else if (mode_event == CHASSIS_FSM_EVENT_NONE && switch_is_down(sw1)) {
+            mode_event = CHASSIS_FSM_EVENT_RC_AUTO_2;
         }
 
-        if(MINIPC_KEY_RISING_EDGE(btn3)) {
-            target_yaw_angle = 0.0f;
-            target_pitch_angle = 0.0f;
-        }
+        if (mode_event != CHASSIS_FSM_EVENT_NONE)
+            chassis_fsm_dispatch_mode(&fsm_context, mode_event);
 
     }
+
+    /* Match the old project: btn4 is the gripper toggle in both projects. */
+    if (MINIPC_KEY_RISING_EDGE(btn4))
+        chassis_fsm_dispatch_action(&fsm_context, CHASSIS_FSM_EVENT_HAND_TOGGLE);
 }
 
 static void chassis_ctrl_info_get(void)

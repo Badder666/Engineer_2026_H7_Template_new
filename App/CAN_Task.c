@@ -116,7 +116,7 @@ static void Robotic_Arm_Motor_MIT_Or_Disable(FDCAN_TxFrame_TypeDef *frame,
 {
 	if (!m->Data.overheat) {
 		DM_Motor_Command(frame, m, Motor_Enable);
-		//DM_Motor_CAN_TxMessage(frame, m, m->Data.Temp_Target_Position, MIT_NO_USE, kp, kd, m->Data.Feedforward, 16);
+		DM_Motor_CAN_TxMessage(frame, m, m->Data.Temp_Target_Position, MIT_NO_USE, kp, kd, m->Data.Feedforward, 16);
 	} else {
 		DM_Motor_Command(frame, m, Motor_Disable);
 	}

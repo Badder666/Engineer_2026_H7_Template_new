@@ -29,6 +29,10 @@ extern "C" {
 typedef struct {
     /* 关节数据 - 6个float = 24字节 */
     float joint_pos_data[6];
+    uint16_t controller_buttons;
+    uint16_t valid_joint_mask;
+    uint16_t command_sequence;
+    uint32_t controller_time_ms;
 
     /* 自定义控制器数据 - 6字节*/
     uint8_t main_buttons;

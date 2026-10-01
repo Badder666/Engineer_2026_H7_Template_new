@@ -32,11 +32,6 @@
 
 /* USER CODE BEGIN INCLUDE */
 
-/* USB CDC 原始接收缓冲区与状态标志 - 由 MiniPC 等上层模块解析使用 */
-extern uint8_t UserRxBufferHS[];
-extern volatile uint32_t USB_RxLength;
-extern volatile uint8_t  USB_RxReady;
-
 /* USER CODE END INCLUDE */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY

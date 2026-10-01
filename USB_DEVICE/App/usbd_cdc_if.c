@@ -22,6 +22,7 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include "usb_comm.h"
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -93,10 +94,6 @@ uint8_t UserRxBufferHS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferHS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
-/* USB接收缓冲区和状态标志 - 非 static，供 MiniPC 等上层模块通过 extern 访问 */
-#define USB_RX_BUFFER_SIZE  64
-volatile uint32_t USB_RxLength = 0;
-volatile uint8_t  USB_RxReady  = 0;  /* 数据包接收完成标志 */
 /* USER CODE END PRIVATE_VARIABLES */
 
 /**
@@ -155,6 +152,7 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_HS =
 static int8_t CDC_Init_HS(void)
 {
   /* USER CODE BEGIN 8 */
+  USBComm_ResetFromISR();
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceHS, UserTxBufferHS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, UserRxBufferHS);
@@ -170,6 +168,7 @@ static int8_t CDC_Init_HS(void)
 static int8_t CDC_DeInit_HS(void)
 {
   /* USER CODE BEGIN 9 */
+  USBComm_ResetFromISR();
   return (USBD_OK);
   /* USER CODE END 9 */
 }
@@ -264,12 +263,7 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 11 */
-  /* 将接收到的数据复制到本地缓冲区 */
-  if (*Len > 0 && *Len <= USB_RX_BUFFER_SIZE)
-  {
-    USB_RxLength = *Len;
-    USB_RxReady = 1;  /* 标记新数据已接收 */
-  }
+  USBComm_PushFromISR(Buf, *Len);
 
   /* 继续接收下一个数据包 */
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, UserRxBufferHS);

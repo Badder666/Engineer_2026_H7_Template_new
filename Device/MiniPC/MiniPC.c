@@ -16,7 +16,13 @@
 #include "Minipc.h"
 #include "usbd_cdc_if.h"
 #include "arm_config.h"
+#include "custom_controller_protocol.h"
+#include "usb_comm.h"
+#include "main.h"
+#include <math.h>
 #include <string.h>
+
+extern USBD_HandleTypeDef hUsbDeviceHS;
 
 /* Private typedef -----------------------------------------------------------*/
 typedef union {
@@ -64,6 +70,7 @@ MiniPC_DataTypeDef MiniPC_Data_Last = {
 /* Private variables ---------------------------------------------------------*/
 /* 发送缓冲：帧头(1) + 6*float(24) + 校验(1) + 帧尾(1) = 27 字节足够 */
 static uint8_t joint_data_transmit[27] = {0};
+static ControllerStreamParser command_parser;
 
 /* Private functions ---------------------------------------------------------*/
 static float bytes_to_float_union(const uint8_t *buffer)
@@ -93,6 +100,21 @@ static void float_to_bytes_union(float value, uint8_t *buffer)
   */
 uint8_t MiniPC_Transmit_Info(float* Buf, uint16_t Len)
 {
+    if (Buf == NULL || Len != 6U) {
+        return USBD_FAIL;
+    }
+    /* USB teardown must not free the CDC handle while a task submits a frame. */
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED ||
+        hUsbDeviceHS.pClassData == NULL) {
+        __set_PRIMASK(primask);
+        return USBD_FAIL;
+    }
+    if (((USBD_CDC_HandleTypeDef *)hUsbDeviceHS.pClassData)->TxState != 0U) {
+        __set_PRIMASK(primask);
+        return USBD_BUSY;
+    }
     /* 校验位置零，覆盖上一次校验位 */
     joint_data_transmit[Len * 4 + 1] = 0;
     joint_data_transmit[0] = 0xAA;
@@ -103,104 +125,127 @@ uint8_t MiniPC_Transmit_Info(float* Buf, uint16_t Len)
         joint_data_transmit[Len * 4 + 1] += joint_data_transmit[i];
     }
     joint_data_transmit[Len * 4 + 2] = 0x55;
-    return CDC_Transmit_HS(joint_data_transmit, Len * 4 + 3);
+    const uint8_t result = CDC_Transmit_HS(joint_data_transmit, Len * 4 + 3);
+    __set_PRIMASK(primask);
+    return result;
 }
 
-/**
-  * @brief  解析从小电脑接收的 USB 虚拟串口数据
-  * @note   数据包格式：帧头(0xAA) + 数据(57字节) + 校验和(1字节) + 帧尾(0x55)
-  *         数据布局：6个float(24B) + 自定义控制器(6B) + 3个int16_t(6B) + 21个uint8_t(21B)
-  *         总长度：60字节
-  * @retval None - 解析结果存入全局变量 MiniPC_Data
-  */
-void MiniPC_Receive_Info(void)
+static void receive_frame(const uint8_t *frame, size_t length, void *context)
 {
-    /* 数据部分大小：6*4 + 6 + 3*2 + 21*1 = 57字节 */
-    const uint32_t data_len = 57;
-    /* 完整数据包：帧头(1) + 数据(57) + 校验(1) + 帧尾(1) = 60字节 */
-    const uint32_t packet_len = data_len + 3;
-
-    /* 检查是否有新数据到达 */
-    if (USB_RxReady == 0) {
-        return;
+    (void)context;
+    MiniPC_DataTypeDef next = MiniPC_Data;
+    if (length == CONTROLLER_COMMAND_SIZE) {
+        ControllerCommand command;
+        if (!ControllerCommand_Decode(frame, length, &command)) {
+            return;
+        }
+        for (size_t i = 0; i < 6U; ++i) {
+            if ((command.valid_joint_mask & (1U << i)) != 0U) {
+                next.joint_pos_data[i] = command.positions[i];
+            }
+        }
+        next.controller_buttons = command.buttons;
+        next.valid_joint_mask = command.valid_joint_mask;
+        next.command_sequence = command.sequence;
+        next.controller_time_ms = command.timestamp_ms;
+        const bool operator_valid = (command.flags & CONTROLLER_OPERATOR_VALID) != 0U;
+        next.joystick_x = operator_valid ? command.joystick_x : 2048U;
+        next.joystick_y = operator_valid ? command.joystick_y : 2048U;
+        next.mouse_x = operator_valid ? command.mouse[0] : 0;
+        next.mouse_y = operator_valid ? command.mouse[1] : 0;
+        next.mouse_z = operator_valid ? command.mouse[2] : 0;
+        next.mouse_left = operator_valid ? command.mouse_buttons[0] : 0U;
+        next.mouse_right = operator_valid ? command.mouse_buttons[1] : 0U;
+        next.mouse_mid = operator_valid ? command.mouse_buttons[2] : 0U;
+        next.main_buttons = operator_valid ? command.main_buttons : 0U;
+        next.handle_buttons = operator_valid ? command.handle_buttons : 0U;
+        const uint32_t keys = operator_valid ? command.keys : 0U;
+        uint8_t *key_fields[] = {
+            &next.key_w, &next.key_s, &next.key_a, &next.key_d,
+            &next.key_shift, &next.key_ctrl, &next.key_q, &next.key_e,
+            &next.key_r, &next.key_f, &next.key_g, &next.key_z,
+            &next.key_x, &next.key_c, &next.key_v, &next.key_b,
+            &next.key_1, &next.key_2,
+        };
+        for (size_t i = 0; i < 18U; ++i) {
+            *key_fields[i] = (uint8_t)((keys >> i) & 1U);
+        }
+    } else {
+        /* 旧 60 字节帧已由字节流解析器校验，此处只解析有效载荷。 */
+        const uint8_t *pbuf = &frame[1];
+        uint32_t idx = 0;
+        for (uint32_t i = 0; i < 6; i++) {
+            const float position = bytes_to_float_union(&pbuf[idx]);
+            if (!isfinite(position)) {
+                return;
+            }
+            next.joint_pos_data[i] = position;
+            idx += 4;
+        }
+        next.main_buttons   = pbuf[idx++];
+        next.handle_buttons = pbuf[idx++];
+        next.joystick_x     = pbuf[idx] | (pbuf[idx + 1] << 8);
+        idx += 2;
+        next.joystick_y     = pbuf[idx] | (pbuf[idx + 1] << 8);
+        idx += 2;
+        next.mouse_x = (int16_t)(pbuf[idx] | (pbuf[idx + 1] << 8));
+        idx += 2;
+        next.mouse_y = (int16_t)(pbuf[idx] | (pbuf[idx + 1] << 8));
+        idx += 2;
+        next.mouse_z = (int16_t)(pbuf[idx] | (pbuf[idx + 1] << 8));
+        idx += 2;
+        next.mouse_left  = pbuf[idx++];
+        next.mouse_right = pbuf[idx++];
+        next.mouse_mid   = pbuf[idx++];
+        next.key_w       = pbuf[idx++];
+        next.key_s       = pbuf[idx++];
+        next.key_a       = pbuf[idx++];
+        next.key_d       = pbuf[idx++];
+        next.key_shift   = pbuf[idx++];
+        next.key_ctrl    = pbuf[idx++];
+        next.key_q       = pbuf[idx++];
+        next.key_e       = pbuf[idx++];
+        next.key_r       = pbuf[idx++];
+        next.key_f       = pbuf[idx++];
+        next.key_g       = pbuf[idx++];
+        next.key_z       = pbuf[idx++];
+        next.key_x       = pbuf[idx++];
+        next.key_c       = pbuf[idx++];
+        next.key_v       = pbuf[idx++];
+        next.key_b       = pbuf[idx++];
+        next.key_1       = pbuf[idx++];
+        next.key_2       = pbuf[idx++];
+        next.controller_buttons = 0U;
+        next.valid_joint_mask = 0x3FU;
+        next.command_sequence = 0U;
+        next.controller_time_ms = 0U;
     }
-    USB_RxReady = 0;
-
-    if (USB_RxLength < packet_len) {
-        return;
-    }
-
-    /* 帧头帧尾检查 */
-    if (UserRxBufferHS[0] != 0xAA ||
-        UserRxBufferHS[packet_len - 1] != 0x55) {
-        return;
-    }
-
-    /* 校验和计算：累加所有数据字节 */
-    uint8_t verification = 0;
-    for (uint32_t i = 1; i <= data_len; i++) {
-        verification += UserRxBufferHS[i];
-    }
-    if (UserRxBufferHS[packet_len - 2] != verification) {
-        return;
-    }
-
-    uint8_t* pbuf = &UserRxBufferHS[1];
-    uint32_t idx = 0;
-
-    /* 解析6个float - 关节数据 (偏移 0-23) */
-    for (uint32_t i = 0; i < 6; i++) {
-        MiniPC_Data.joint_pos_data[i] = bytes_to_float_union(&pbuf[idx]);
-        idx += 4;
-    }
-
-    /* 解析自定义控制器数据 - 6字节 (偏移 24-29) */
-    MiniPC_Data.main_buttons   = pbuf[idx++];
-    MiniPC_Data.handle_buttons = pbuf[idx++];
-    /* 从 handle_buttons 位域拆出独立按键标志, 适配 MINIPC_KEY_RISING_EDGE 边沿检测宏 */
-    MiniPC_Data.btn1 = (MiniPC_Data.handle_buttons >> 0) & 0x01U;
-    MiniPC_Data.btn2 = (MiniPC_Data.handle_buttons >> 1) & 0x01U;
-    MiniPC_Data.btn3 = (MiniPC_Data.handle_buttons >> 2) & 0x01U;
-    MiniPC_Data.btn4 = (MiniPC_Data.handle_buttons >> 3) & 0x01U;
-    MiniPC_Data.joystick_x     = pbuf[idx] | (pbuf[idx + 1] << 8);
-    idx += 2;
-    MiniPC_Data.joystick_y     = pbuf[idx] | (pbuf[idx + 1] << 8);
-    idx += 2;
-
-    /* 解析3个int16_t - 鼠标数据 (偏移 30-35) */
-    MiniPC_Data.mouse_x = (int16_t)(pbuf[idx] | (pbuf[idx + 1] << 8));
-    idx += 2;
-    MiniPC_Data.mouse_y = (int16_t)(pbuf[idx] | (pbuf[idx + 1] << 8));
-    idx += 2;
-    MiniPC_Data.mouse_z = (int16_t)(pbuf[idx] | (pbuf[idx + 1] << 8));
-    idx += 2;
-
-    /* 解析21个uint8_t - 鼠标按键和键盘按键 (偏移 30-50) */
-    MiniPC_Data.mouse_left  = pbuf[idx++];
-    MiniPC_Data.mouse_right = pbuf[idx++];
-    MiniPC_Data.mouse_mid   = pbuf[idx++];
-    MiniPC_Data.key_w       = pbuf[idx++];
-    MiniPC_Data.key_s       = pbuf[idx++];
-    MiniPC_Data.key_a       = pbuf[idx++];
-    MiniPC_Data.key_d       = pbuf[idx++];
-    MiniPC_Data.key_shift   = pbuf[idx++];
-    MiniPC_Data.key_ctrl    = pbuf[idx++];
-    MiniPC_Data.key_q       = pbuf[idx++];
-    MiniPC_Data.key_e       = pbuf[idx++];
-    MiniPC_Data.key_r       = pbuf[idx++];
-    MiniPC_Data.key_f       = pbuf[idx++];
-    MiniPC_Data.key_g       = pbuf[idx++];
-    MiniPC_Data.key_z       = pbuf[idx++];
-    MiniPC_Data.key_x       = pbuf[idx++];
-    MiniPC_Data.key_c       = pbuf[idx++];
-    MiniPC_Data.key_v       = pbuf[idx++];
-    MiniPC_Data.key_b       = pbuf[idx++];
-    MiniPC_Data.key_1       = pbuf[idx++];
-    MiniPC_Data.key_2       = pbuf[idx++];
+    next.btn1 = (next.handle_buttons >> 0) & 0x01U;
+    next.btn2 = (next.handle_buttons >> 1) & 0x01U;
+    next.btn3 = (next.handle_buttons >> 2) & 0x01U;
+    next.btn4 = (next.handle_buttons >> 3) & 0x01U;
 
     /* 收到完整有效帧 → 复位在线计数, 清除离线标志 */
-    MiniPC_Data.online_cnt = 0xFAU;
-    MiniPC_Data.lost       = false;
+    next.online_cnt = 0xFAU;
+    next.lost = false;
+    MiniPC_Data = next;
+}
+
+void MiniPC_Receive_Info(void)
+{
+    uint8_t chunk[64];
+    /* Bound work per Detect_Task iteration even if USB traffic is continuous. */
+    for (size_t i = 0; i < 16U; ++i) {
+        bool discontinuity;
+        size_t length = USBComm_Read(chunk, sizeof(chunk), &discontinuity);
+        if (discontinuity) {
+            command_parser.used = 0U;
+        }
+        if (length == 0U) {
+            break;
+        }
+        ControllerStream_Feed(&command_parser, chunk, length, receive_frame, NULL);
+    }
 }
 
 /**
@@ -209,7 +254,7 @@ void MiniPC_Receive_Info(void)
  *         - 每收到一帧有效 USB 数据, MiniPC_Receive_Info 将 online_cnt 重置为 0xFA
  *         - 本函数每主循环调用, 递减 online_cnt
  *         - 连续约 200 次循环未收到新数据 (online_cnt ≤ 0x32) 视为离线,
- *           清零数据并置 lost = true, 直到下一帧有效数据恢复
+ *           置 lost = true, 保留关节目标, 直到下一帧有效数据恢复
  */
 void MiniPC_Offline_Monitor(void)
 {

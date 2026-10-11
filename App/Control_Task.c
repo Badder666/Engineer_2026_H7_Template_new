@@ -88,6 +88,7 @@ static float Robotic_Arm_FF_PID_Param_B[PID_PARAMETER_NUM] = {
 
 PID_Info_TypeDef Chassis_PID[4];
 PID_Info_TypeDef Robotic_Arm_FF_PID[ROBOTIC_ARM_DOF];
+static bool robotic_arm_startup_ramping = true;
 
 TickType_t Control_Task_SysTick = 0;
 TickType_t Timer_When_Lift_Stage_Changed = 0;
@@ -417,11 +418,25 @@ static void Elevator_Motor_cal(void)
 
 static void Robotic_Arm_Motor_cal(void)
 {
+    const float ramp = robotic_arm_startup_ramping
+        ? ROBOTIC_ARM_STARTUP_POSITION_RAMP
+        : ROBOTIC_ARM_TARGET_POSITION_RAMP;
+    bool targets_reached = true;
+
     for (uint8_t i = 0; i < ROBOTIC_ARM_DOF; i++) {
+        const float target_position = Robotic_Arm_Motor[i].Data.Target_Position;
+        if (fabsf(target_position - Robotic_Arm_Motor[i].Data.Temp_Target_Position) > ramp) {
+            targets_reached = false;
+        }
         Robotic_Arm_Motor[i].Data.Temp_Target_Position = f_Ramp_Calc(
             Robotic_Arm_Motor[i].Data.Temp_Target_Position,
-            Robotic_Arm_Motor[i].Data.Target_Position,
-            ROBOTIC_ARM_TARGET_POSITION_RAMP);
+            target_position,
+            ramp);
+    }
+
+    /* 六轴启动插值全部完成后，后续目标使用控制阶段的斜坡步长。 */
+    if (targets_reached) {
+        robotic_arm_startup_ramping = false;
     }
 }
 
@@ -542,6 +557,7 @@ static void Elevator_set_start_error_pos(void)
 }
 static void Robotic_Arm_reset_ramped_target(void)
 {
+    robotic_arm_startup_ramping = true;
     for (uint8_t i = 0; i < ROBOTIC_ARM_DOF; i++) {
         Robotic_Arm_Motor[i].Data.Temp_Target_Position = Robotic_Arm_Motor[i].Data.Position;
     }

@@ -49,7 +49,8 @@ typedef enum
 #define J6_INITIAL_POS 0.00f 
 
 /** 每个 1 ms 控制周期允许关节电机目标位置变化的最大值 (rad) */
-#define ROBOTIC_ARM_TARGET_POSITION_RAMP 0.001f
+#define ROBOTIC_ARM_STARTUP_POSITION_RAMP 0.001f
+#define ROBOTIC_ARM_TARGET_POSITION_RAMP 0.005f
 
 #define GRIPPER_OPEN_POS -21.0f
 #define GRIPPER_CLOSE_POS 133.8f
